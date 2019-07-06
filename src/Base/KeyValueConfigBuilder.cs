@@ -23,6 +23,7 @@ namespace Microsoft.Configuration.ConfigurationBuilders
         public const string stripPrefixTag = "stripPrefix";
         public const string tokenPatternTag = "tokenPattern";
         public const string optionalTag = "optional";
+        public const string recursionCheckTag = "recursionCheck";
         #pragma warning restore CS1591 // No xml comments for tag literals.
 
         private NameValueCollection _config = null;
@@ -31,6 +32,7 @@ namespace Microsoft.Configuration.ConfigurationBuilders
         private bool _lazyInitialized = false;
         private bool _greedyInitialized = false;
         private bool _inAppSettings = false;
+        private string _builderId;
         private AppSettingsSection _appSettings = null;
 
         /// <summary>
@@ -54,6 +56,10 @@ namespace Microsoft.Configuration.ConfigurationBuilders
         /// </summary>
         public string TokenPattern { get { EnsureInitialized(); return _tokenPattern; } protected set { _tokenPattern = value; } }
         private string _tokenPattern = @"\$\{(\w+)\}";
+        /// <summary>
+        /// Gets or sets the behavior to use when recursion is detected.
+        /// </summary>
+        public RecursionBehavior RecursionCheck { get; private set; } = RecursionBehavior.Throw;
 
         /// <summary>
         /// Looks up a single 'value' for the given 'key.'
@@ -82,7 +88,7 @@ namespace Microsoft.Configuration.ConfigurationBuilders
         public virtual string UpdateKey(string rawKey) { return rawKey; }
 
         /// <summary>
-        /// Initializes the configuration builder.
+        /// Initializes the configuration builder. DO NOT OVERRIDE. Use <see cref="LazyInitialize(string, NameValueCollection)"/> instead.
         /// </summary>
         /// <param name="name">The friendly name of the provider.</param>
         /// <param name="config">A collection of the name/value pairs representing builder-specific attributes specified in the configuration for this provider.</param>
@@ -91,17 +97,24 @@ namespace Microsoft.Configuration.ConfigurationBuilders
             base.Initialize(name, config);
             _config = config ?? new NameValueCollection();
 
-            // Mode can't be lazy initialized, because it is used to determine how late we can go before initializing.
-            // Reading it would force initialization too early in many cases.
+            _builderId = $"{name}[{this.GetType().ToString()}]";
+
+            // Neither Mode nor RecursionCheck can be lazy initialized, because they are used to determine how late we can go before initializing and whether
+            // it is even safe to do so. Reading them would force initialization too early in many cases.
             if (_config[modeTag] != null)
             {
                 // We want an exception here if 'mode' is specified but unrecognized.
                 Mode = (KeyValueMode)Enum.Parse(typeof(KeyValueMode), config[modeTag], true);
             }
+            if (_config[recursionCheckTag] != null)
+            {
+                // We want an exception here if 'recursionCheck' is specified but unrecognized.
+                RecursionCheck = (RecursionBehavior)Enum.Parse(typeof(RecursionBehavior), config[recursionCheckTag], true);
+            }
         }
 
         /// <summary>
-        /// Initializes the configuration builder lazily.
+        /// Initializes the configuration builder lazily when necessary.
         /// </summary>
         /// <param name="name">The friendly name of the provider.</param>
         /// <param name="config">A collection of the name/value pairs representing builder-specific attributes specified in the configuration for this provider.</param>
@@ -169,53 +182,74 @@ namespace Microsoft.Configuration.ConfigurationBuilders
         // Sub-classes need not worry about this stuff, even though some of it is "public" because it comes from the framework.
 
         #pragma warning disable CS1591 // No xml comments for overrides that implementing classes shouldn't worry about.
+        /// <summary>
+        /// Do not override.
+        /// </summary>
         public override XmlNode ProcessRawXml(XmlNode rawXml)
         {
             _inAppSettings = (rawXml.Name == "appSettings");    // System.Configuration hard codes this, so we might as well too.
 
             if (Mode == KeyValueMode.Expand)
-                return ExpandTokens(rawXml);
+            {
+                using (var rc = new RecursionCheck(_builderId, rawXml.Name, RecursionCheck))
+                {
+                    if (rc.ShouldStop)
+                        return rawXml;
+
+                    return ExpandTokens(rawXml);
+                }
+            }
 
             return rawXml;
         }
 
+        /// <summary>
+        /// Do not override.
+        /// </summary>
         public override ConfigurationSection ProcessConfigurationSection(ConfigurationSection configSection)
         {
             // Expand mode only works on the raw string input
             if (Mode == KeyValueMode.Expand)
                 return configSection;
 
-            // See if we know how to process this section
-            ISectionHandler handler = SectionHandlersSection.GetSectionHandler(configSection);
-            if (handler == null)
-                return configSection;
-
-            _appSettings = configSection as AppSettingsSection;
-
-            // Strict Mode. Only replace existing key/values.
-            if (Mode == KeyValueMode.Strict)
+            using (var rc = new RecursionCheck(_builderId, configSection.SectionInformation.Name, RecursionCheck))
             {
-                foreach (var configItem in handler)
-                {
-                    string newValue = GetValueInternal(configItem.Key);
-                    string newKey = UpdateKey(configItem.Key);
+                if (rc.ShouldStop)
+                    return configSection;
 
-                    if (newValue != null)
-                        handler.InsertOrUpdate(newKey, newValue, configItem.Key, configItem.Value);
-                }
-            }
+                // See if we know how to process this section
+                ISectionHandler handler = SectionHandlersSection.GetSectionHandler(configSection);
+                if (handler == null)
+                    return configSection;
 
-            // Greedy Mode. Insert all key/values.
-            else if (Mode == KeyValueMode.Greedy)
-            {
-                EnsureGreedyInitialized();
-                foreach (KeyValuePair<string, string> kvp in _cachedValues)
+                if (configSection.SectionInformation.Name == "appSettings")
+                    _appSettings = configSection as AppSettingsSection;
+
+                // Strict Mode. Only replace existing key/values.
+                if (Mode == KeyValueMode.Strict)
                 {
-                    if (kvp.Value != null)
+                    foreach (var configItem in handler)
                     {
-                        string oldKey = TrimPrefix(kvp.Key);
-                        string newKey = UpdateKey(oldKey);
-                        handler.InsertOrUpdate(newKey, kvp.Value, oldKey);
+                        string newValue = GetValueInternal(configItem.Key);
+                        string newKey = UpdateKey(configItem.Key);
+
+                        if (newValue != null)
+                            handler.InsertOrUpdate(newKey, newValue, configItem.Key, configItem.Value);
+                    }
+                }
+
+                // Greedy Mode. Insert all key/values.
+                else if (Mode == KeyValueMode.Greedy)
+                {
+                    EnsureGreedyInitialized();
+                    foreach (KeyValuePair<string, string> kvp in _cachedValues)
+                    {
+                        if (kvp.Value != null)
+                        {
+                            string oldKey = TrimPrefix(kvp.Key);
+                            string newKey = UpdateKey(oldKey);
+                            handler.InsertOrUpdate(newKey, kvp.Value, oldKey);
+                        }
                     }
                 }
             }
@@ -259,9 +293,10 @@ namespace Microsoft.Configuration.ConfigurationBuilders
                     }
                 }
             }
+            catch (ConfigurationErrorsException) { throw; } // Just bubble up already-wrapped config exceptions.
             catch (Exception e)
             {
-                throw new Exception($"Error in Configuration Builder '{Name}'::GetAllValues({KeyPrefix})", e);
+                throw new Exception($"Error in Configuration Builder '{Name}'::GetAllValues({KeyPrefix}) - {e.Message}", e);
             }
         }
 
@@ -307,9 +342,10 @@ namespace Microsoft.Configuration.ConfigurationBuilders
 
                 return (_cachedValues.ContainsKey(sourceKey)) ? _cachedValues[sourceKey] : _cachedValues[sourceKey] = GetValue(sourceKey);
             }
+            catch (ConfigurationErrorsException) { throw; } // Just bubble up already-wrapped config exceptions.
             catch (Exception e)
             {
-                throw new Exception($"Error in Configuration Builder '{Name}'::GetValue({key})", e);
+                throw new Exception($"Error in Configuration Builder '{Name}'::GetValue({key}) - {e.Message}", e);
             }
         }
 

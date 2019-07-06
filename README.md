@@ -20,6 +20,10 @@ Version 2 is here with some new features:
 		on all key/value config builders.
   * Section Handlers - This feature allows users to develop extensions that will apply key/value config to sections other than `appSettings` and `connectionStrings`
 		if desired. Read more about this feature in the [Section Handlers](#sectionhandlers) segment below.
+  * Recursion Detection - With the V1 config builders, there were some reports of hangs or other strange behaviors that ultimately traced back to config builders
+		causing a loop back into loading the same config section it is supposed to be processing. Robust handling of this situation would require help from the
+		.Net configuration system which does not exist. But V2 of these builders comes with some good-faith attempts to at least detect this situation and throw
+		a more easily diagnosed exception. See the [Recursion Detection](#recursiondetection) segment below for more information.
 
 ## Key/Value Config Builders
 
@@ -340,6 +344,34 @@ collection. As an example, here is what their explicit declaration would look li
 </Microsoft.Configuration.ConfigurationBuilders.SectionHandlers>
 ```
 When adding additional handlers, the name of the section must be 'Microsoft.Configuration.ConfigurationBuilders.SectionHandlers' so key/value config builders can find it.
+
+## Recursion Detection
+The general recommendation for configuration builders is to keep things simple, and the set of key-value builders in this repo are intended to promote
+that approach. With the V1 builders however, there were some reports of hangs or other strange behaviors that ultimately traced back to the config builders
+triggering a loop - loading the same config section it is supposed to be processing. Robust handling of this situation would require help from the
+.Net configuration system which does not exist.
+
+In most reports, the loop back to the same config section was quite indirect. Consider the scenario where an Azure Key Vault config builder is added
+to the AppSettings config section. At the same time, a logging module is configured for the application which logs all HTTP requests made with
+`HttpClient`. At first glance, this does not appear to be a problem. But when the application runs, it hangs. The reason is because when loading AppSettings,
+the key vault config builder makes an HTTP request to read key/value pairs, which in turn triggers the logging module, which tries to initialize itself
+with values from AppSettings, which results in a recursive scenario.
+
+As mentioned above, there is little that can be done in these packages to gracefully and generically handle all possible cases of this loop-back scenario.
+But V2 now ships with a good-faith loop-back detection mechanism that will react to the situation in one of three ways. All `KeyValueConfigurationBuilder`s will
+use the `recursionCheck` attribute to determine which action should be taken when recursion is detected. __A non-default setting here can result in unexpected, inaccurate
+config results, or even stack overflow exceptions and application hangs.__ (As such, this attribute is not documented in the examples
+above with the other common attributes, because we do not recommend changing the default.)
+
+  * `Throw` - This is the default. With this setting, when a `KeyValueConfigurationBuilder` detects the possibility of a recursive situation, it will throw an
+		`InvalidOperationException` with a message indicating such a scenario was detected. (Note that this will likely get wrapped by .Net in a `ConfigurationErrorsException`
+		before reaching the application code that was requesting the config section.)
+  * `Stop` - With this setting, if a `KeyValueConfigurationBuilder` detects that the possibility of a recursive situation, it will not do any further processing,
+		and will instead return the rawXml string or `ConfigurationSection` that was passed in as is. Because of the way the .Net configuration system works, this
+		behavior is likely to result in a `ConfigurationSection` that is half-processed, or not affected by configuration builders at all. This setting
+		prevents hangs and fatal exceptions, but because of the inconsistent nature of its results, it is not recommended.
+  * `None` - This last setting preserves the behavior of V1, where no consideration was given to detecting loops like this. Only use this setting if it is known
+		that all config builders on the section are safe for re-entry in this manner, and that steps are taken to guard against stack overflow.
 
 ## Implementing More Key/Value Config Builders
 

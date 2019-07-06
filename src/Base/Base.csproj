@@ -42,8 +42,10 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="RecursionBehavior.cs" />
     <Compile Include="SectionHandler.cs" />
     <Compile Include="SectionHandlerSection.cs" />
+    <Compile Include="RecursionCheck.cs" />
     <Compile Include="Utils.cs" />
     <Compile Include="KeyValueConfigBuilder.cs" />
     <Compile Include="KeyValueMode.cs" />
